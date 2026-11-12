@@ -1,15 +1,19 @@
 
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const DEFAULT_MODEL = "llama-3.3-70b-versatile";
-const TIMEOUT = 30000;
-const MAX_ATTEMPTS = 3;
+const DEFAULT_MODEL = "openai/gpt-oss-20b";
+const TIMEOUT_MS = 30000;
+const MAX_KEYS = 6;
 
 let cursor = 0;
 
 function getKeys() {
-  return Array.from({ length: 5 }, (_, i) =>
+  return Array.from({ length: MAX_KEYS }, (_, i) =>
     process.env[`GROQ_API_KEY_${i + 1}`]
-  ).filter(Boolean);
+  ).filter(key => typeof key === "string" && key.trim());
+}
+
+function getErrorMessage(data, fallback) {
+  return data?.error?.message || fallback;
 }
 
 export default async function handler(req, res) {
@@ -17,9 +21,7 @@ export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
 
   if (req.method !== "POST") {
     return res.status(405).json({
@@ -51,25 +53,25 @@ export default async function handler(req, res) {
     if (!keys.length) {
       return res.status(503).json({
         success: false,
-        error: "Groq is not configured."
+        error: "No Groq API keys are configured."
       });
     }
 
     const model = process.env.GROQ_MODEL || DEFAULT_MODEL;
-    const start = cursor % keys.length;
-    let lastError = "Groq unavailable";
-    let lastStatus = 502;
 
-    for (
-      let attempt = 0;
-      attempt < Math.min(keys.length, MAX_ATTEMPTS);
-      attempt++
-    ) {
-      const index = (start + attempt) % keys.length;
+    // Start from the next key for each request handled by this instance.
+    const startIndex = cursor % keys.length;
+    cursor = (startIndex + 1) % keys.length;
+
+    let lastStatus = 503;
+    let lastError = "All configured Groq keys failed.";
+
+    for (let attempt = 0; attempt < keys.length; attempt++) {
+      const keyIndex = (startIndex + attempt) % keys.length;
       const controller = new AbortController();
       const timeout = setTimeout(
         () => controller.abort(),
-        TIMEOUT
+        TIMEOUT_MS
       );
 
       try {
@@ -77,14 +79,18 @@ export default async function handler(req, res) {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
-            Authorization: `Bearer ${keys[index]}`
+            Authorization: `Bearer ${keys[keyIndex]}`
           },
           body: JSON.stringify({
             model,
             messages: [
-              { role: "user", content: prompt }
+              {
+                role: "user",
+                content: prompt
+              }
             ],
-            temperature: 0.8
+            temperature: 0.8,
+            max_tokens: 1000
           }),
           signal: controller.signal
         });
@@ -92,48 +98,47 @@ export default async function handler(req, res) {
         const data = await response.json().catch(() => ({}));
 
         if (response.ok) {
-          const text =
-            data?.choices?.[0]?.message?.content || "";
+          const text = data?.choices?.[0]?.message?.content || "";
 
-          if (!text) {
-            return res.status(502).json({
-              success: false,
-              error: "Empty AI response."
-            });
+          if (!text.trim()) {
+            lastStatus = 502;
+            lastError = "Groq returned an empty response.";
+            continue;
           }
-
-          cursor = (index + 1) % keys.length;
 
           return res.status(200).json({
             success: true,
             text,
             tool: body.tool || null,
             model: data.model || model,
-            provider: "groq"
+            provider: "groq",
+            keySlot: keyIndex + 1
           });
         }
 
         lastStatus = response.status;
-        lastError = data?.error?.message || "Groq request failed";
+        lastError = getErrorMessage(data, "Groq request failed.");
 
-        // Do not retry invalid credentials or bad requests.
+        // These errors may be specific to one key.
+        // Try another configured key.
         if (
-          response.status === 400 ||
           response.status === 401 ||
           response.status === 403 ||
-          response.status === 404
+          response.status === 404 ||
+          response.status === 429 ||
+          response.status >= 500
         ) {
-          break;
+          continue;
         }
 
-        // Retry only rate limits and temporary server errors.
-        if (response.status !== 429 && response.status < 500) {
-          break;
-        }
+        // Other 4xx errors are usually request/configuration errors.
+        break;
 
       } catch (error) {
         lastStatus = error.name === "AbortError" ? 504 : 502;
-        lastError = "Temporary network or timeout error.";
+        lastError = error.name === "AbortError"
+          ? "Groq request timed out."
+          : "Temporary network error.";
       } finally {
         clearTimeout(timeout);
       }
@@ -141,11 +146,9 @@ export default async function handler(req, res) {
 
     return res.status(lastStatus).json({
       success: false,
-      error: lastStatus === 429
-        ? "Groq rate limit reached."
-        : lastStatus >= 500
-          ? "Groq temporarily unavailable."
-          : lastError
+      error: lastError,
+      provider: "groq",
+      keysTried: keys.length
     });
 
   } catch (error) {
