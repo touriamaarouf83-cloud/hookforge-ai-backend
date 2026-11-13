@@ -1,31 +1,84 @@
 
-const PROVIDERS = [
-  {
-    name: "groq",
-    url: "https://api.groq.com/openai/v1/chat/completions",
-    getKeys: () =>
-      Array.from({ length: 6 }, (_, i) =>
-        process.env[`GROQ_API_KEY_${i + 1}`]
-      ).filter(k => typeof k === "string" && k.trim()),
-    getModel: () =>
-      process.env.GROQ_MODEL || "openai/gpt-oss-20b"
-  },
-  {
-    name: "openrouter",
-    url: "https://openrouter.ai/api/v1/chat/completions",
-    getKeys: () => [
-      process.env.OPENROUTER_API_KEY,
-      process.env.OPENROUTER_API_KEY_2,
-      process.env.OPENROUTER_API_KEY_3,
-      process.env.OPENROUTER_API_KEY_4
-    ].filter(k => typeof k === "string" && k.trim()),
-    getModel: () =>
-      process.env.OPENROUTER_MODEL || "openrouter/free"
-  }
-];
+const TIMEOUTS = {
+  siliconflow: 8000,
+  groq: 15000,
+  openrouter: 15000
+};
 
-const TIMEOUT_MS = 25000;
 const MAX_PROMPT_LENGTH = 20000;
+
+const DEFAULT_MODELS = {
+  hooks: "Qwen/Qwen3-8B",
+  reasoning: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+  general: "THUDM/GLM-4-9B-0414",
+  groq: "openai/gpt-oss-20b",
+  openrouter: "openrouter/free"
+};
+
+const TOOL_CONFIG = {
+  hooks: {
+    model: DEFAULT_MODELS.hooks,
+    temperature: 0.75,
+    max_tokens: 800
+  },
+  titles: {
+    model: DEFAULT_MODELS.hooks,
+    temperature: 0.75,
+    max_tokens: 800
+  },
+  agent: {
+    model: DEFAULT_MODELS.hooks,
+    temperature: 0.75,
+    max_tokens: 800
+  },
+  studio: {
+    model: DEFAULT_MODELS.hooks,
+    temperature: 0.75,
+    max_tokens: 800
+  },
+
+  scripts: {
+    model: DEFAULT_MODELS.reasoning,
+    temperature: 0.7,
+    max_tokens: 2500
+  },
+  outline: {
+    model: DEFAULT_MODELS.reasoning,
+    temperature: 0.7,
+    max_tokens: 2500
+  },
+  ideas: {
+    model: DEFAULT_MODELS.reasoning,
+    temperature: 0.7,
+    max_tokens: 2500
+  },
+  score: {
+    model: DEFAULT_MODELS.reasoning,
+    temperature: 0.7,
+    max_tokens: 2500
+  },
+
+  description: {
+    model: DEFAULT_MODELS.general,
+    temperature: 0.4,
+    max_tokens: 1000
+  },
+  tags: {
+    model: DEFAULT_MODELS.general,
+    temperature: 0.4,
+    max_tokens: 1000
+  },
+  hashtags: {
+    model: DEFAULT_MODELS.general,
+    temperature: 0.4,
+    max_tokens: 1000
+  },
+  notes: {
+    model: DEFAULT_MODELS.general,
+    temperature: 0.4,
+    max_tokens: 1000
+  }
+};
 
 function parseBody(req) {
   if (!req.body) return {};
@@ -41,14 +94,93 @@ function parseBody(req) {
   return req.body;
 }
 
+function normalizeTool(value) {
+  return String(value || "")
+    .toLowerCase()
+    .trim()
+    .replace(/[\s-]+/g, "_")
+    .replace(/[^a-z0-9_]/g, "");
+}
+
+function resolveToolConfig(body) {
+  const tool = normalizeTool(body.taskType || body.tool);
+
+  // Exact match first.
+  if (TOOL_CONFIG[tool]) {
+    return {
+      tool,
+      ...TOOL_CONFIG[tool]
+    };
+  }
+
+  // Handle common frontend naming variations.
+  if (/hook/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.hooks };
+  }
+
+  if (/title/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.titles };
+  }
+
+  if (/script/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.scripts };
+  }
+
+  if (/outline/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.outline };
+  }
+
+  if (/idea/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.ideas };
+  }
+
+  if (/score|analyz/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.score };
+  }
+
+  if (/description/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.description };
+  }
+
+  if (/tag/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.tags };
+  }
+
+  if (/hashtag/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.hashtags };
+  }
+
+  if (/note/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.notes };
+  }
+
+  if (/agent|assistant|chat/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.agent };
+  }
+
+  if (/studio/.test(tool)) {
+    return { tool, ...TOOL_CONFIG.studio };
+  }
+
+  // Safe default for unrecognized tools.
+  return {
+    tool: tool || "unknown",
+    ...TOOL_CONFIG.hooks
+  };
+}
+
 function extractText(data) {
   const content = data?.choices?.[0]?.message?.content;
 
-  if (typeof content === "string") return content.trim();
+  if (typeof content === "string") {
+    return content.trim();
+  }
 
   if (Array.isArray(content)) {
     return content
-      .map(item => typeof item?.text === "string" ? item.text : "")
+      .map(item =>
+        typeof item?.text === "string" ? item.text : ""
+      )
       .join("")
       .trim();
   }
@@ -56,46 +188,121 @@ function extractText(data) {
   return "";
 }
 
-async function callProvider(provider, prompt) {
-  const keys = provider.getKeys();
-
-  if (!keys.length) {
-    return { success: false, reason: "no_keys" };
+function getProviderKeys(provider) {
+  if (provider === "siliconflow") {
+    return [
+      process.env.SILICONFLOW_API_KEY
+    ].filter(key => typeof key === "string" && key.trim());
   }
 
-  const model = provider.getModel();
+  if (provider === "groq") {
+    return Array.from(
+      { length: 6 },
+      (_, index) => process.env[`GROQ_API_KEY_${index + 1}`]
+    ).filter(key => typeof key === "string" && key.trim());
+  }
 
-  for (let i = 0; i < keys.length; i++) {
+  if (provider === "openrouter") {
+    return [
+      process.env.OPENROUTER_API_KEY,
+      process.env.OPENROUTER_API_KEY_2,
+      process.env.OPENROUTER_API_KEY_3,
+      process.env.OPENROUTER_API_KEY_4
+    ].filter(key => typeof key === "string" && key.trim());
+  }
+
+  return [];
+}
+
+function getProviderConfig(provider, toolConfig) {
+  if (provider === "siliconflow") {
+    return {
+      name: "siliconflow",
+      url:
+        (process.env.SILICONFLOW_BASE_URL ||
+          "https://api.siliconflow.com/v1")
+          .replace(/\/+$/, "") + "/chat/completions",
+      model: toolConfig.model,
+      temperature: toolConfig.temperature,
+      max_tokens: toolConfig.max_tokens,
+      timeout: TIMEOUTS.siliconflow
+    };
+  }
+
+  if (provider === "groq") {
+    return {
+      name: "groq",
+      url: "https://api.groq.com/openai/v1/chat/completions",
+      model: process.env.GROQ_MODEL || DEFAULT_MODELS.groq,
+      temperature: 0.7,
+      max_tokens: toolConfig.max_tokens,
+      timeout: TIMEOUTS.groq
+    };
+  }
+
+  return {
+    name: "openrouter",
+    url: "https://openrouter.ai/api/v1/chat/completions",
+    model: process.env.OPENROUTER_MODEL || DEFAULT_MODELS.openrouter,
+    temperature: 0.7,
+    max_tokens: toolConfig.max_tokens,
+    timeout: TIMEOUTS.openrouter
+  };
+}
+
+function buildMessages(body, prompt) {
+  const messages = [];
+
+  const systemPrompt =
+    typeof body.systemPrompt === "string"
+      ? body.systemPrompt
+      : typeof body.system_prompt === "string"
+        ? body.system_prompt
+        : "";
+
+  if (systemPrompt.trim()) {
+    messages.push({
+      role: "system",
+      content: systemPrompt
+    });
+  }
+
+  messages.push({
+    role: "user",
+    content: prompt
+  });
+
+  return messages;
+}
+
+async function callProvider(provider, body, prompt, toolConfig) {
+  const keys = getProviderKeys(provider);
+
+  if (!keys.length) {
+    return {
+      success: false,
+      reason: "no_keys",
+      status: 503
+    };
+  }
+
+  const config = getProviderConfig(provider, toolConfig);
+
+  for (let index = 0; index < keys.length; index++) {
     const controller = new AbortController();
+
     const timeout = setTimeout(
       () => controller.abort(),
-      TIMEOUT_MS
+      config.timeout
     );
 
     try {
-      const isGroq = provider.name === "groq";
-
-      const payload = {
-        model,
-        messages: [{ role: "user", content: prompt }],
-        temperature: isGroq ? 0.6 : 0.7,
-        ...(isGroq
-          ? {
-              max_completion_tokens: 1200,
-              reasoning_effort: "low",
-              include_reasoning: false
-            }
-          : {
-              max_tokens: 1200
-            })
-      };
-
       const headers = {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${keys[i]}`
+        Authorization: `Bearer ${keys[index]}`
       };
 
-      if (!isGroq) {
+      if (provider === "openrouter") {
         headers["HTTP-Referer"] =
           process.env.OPENROUTER_SITE_URL ||
           "https://hook-forge-prime.base44.app";
@@ -103,7 +310,15 @@ async function callProvider(provider, prompt) {
         headers["X-Title"] = "HookForge AI";
       }
 
-      const response = await fetch(provider.url, {
+      const payload = {
+        model: config.model,
+        messages: buildMessages(body, prompt),
+        temperature: config.temperature,
+        max_tokens: config.max_tokens,
+        stream: false
+      };
+
+      const response = await fetch(config.url, {
         method: "POST",
         headers,
         body: JSON.stringify(payload),
@@ -112,19 +327,21 @@ async function callProvider(provider, prompt) {
 
       const data = await response.json().catch(() => ({}));
 
-      if (response.status === 401 || response.status === 403) {
-        // Authentication failure: try another configured key.
-        continue;
-      }
-
       if (!response.ok) {
-        console.error("[AI Router] Provider response:", {
-          provider: provider.name,
-          status: response.status
+        console.error("[AI Router] Provider error:", {
+          provider,
+          status: response.status,
+          model: config.model
         });
 
-        // Do not rotate keys for shared rate limits,
-        // billing problems, model errors or server failures.
+        // Try another key only for authentication errors.
+        if (
+          (response.status === 401 || response.status === 403) &&
+          index < keys.length - 1
+        ) {
+          continue;
+        }
+
         return {
           success: false,
           reason: "provider_error",
@@ -135,9 +352,9 @@ async function callProvider(provider, prompt) {
       const text = extractText(data);
 
       if (!text) {
-        console.error("[AI Router] Empty response:", {
-          provider: provider.name,
-          model
+        console.error("[AI Router] Empty model response:", {
+          provider,
+          model: config.model
         });
 
         return {
@@ -150,22 +367,25 @@ async function callProvider(provider, prompt) {
       return {
         success: true,
         text,
-        provider: provider.name,
-        model: data?.model || model
+        provider,
+        model: data?.model || config.model,
+        usage: data?.usage || null
       };
 
     } catch (error) {
-      console.error("[AI Router] Request failed:", {
-        provider: provider.name,
-        type: error?.name || "unknown"
+      const timedOut =
+        error?.name === "AbortError" ||
+        error?.name === "TimeoutError";
+
+      console.error("[AI Router] Provider request failed:", {
+        provider,
+        type: timedOut ? "timeout" : "network_error"
       });
 
       return {
         success: false,
-        reason: error?.name === "AbortError"
-          ? "timeout"
-          : "network_error",
-        status: error?.name === "AbortError" ? 504 : 502
+        reason: timedOut ? "timeout" : "network_error",
+        status: timedOut ? 504 : 502
       };
 
     } finally {
@@ -175,12 +395,13 @@ async function callProvider(provider, prompt) {
 
   return {
     success: false,
-    reason: "all_keys_rejected",
+    reason: "authentication_failed",
     status: 503
   };
 }
 
 export default async function handler(req, res) {
+  // CORS compatibility with the existing Base44 frontend.
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader(
@@ -216,21 +437,42 @@ export default async function handler(req, res) {
     });
   }
 
-  for (const provider of PROVIDERS) {
-    const result = await callProvider(provider, prompt);
+  const toolConfig = resolveToolConfig(body);
+
+  // Provider priority: SiliconFlow -> Groq -> OpenRouter.
+  const providerOrder = [
+    "siliconflow",
+    "groq",
+    "openrouter"
+  ];
+
+  for (const provider of providerOrder) {
+    const result = await callProvider(
+      provider,
+      body,
+      prompt,
+      toolConfig
+    );
 
     if (result.success) {
+      console.log("[AI Router] Generation successful:", {
+        provider: result.provider,
+        model: result.model,
+        tool: toolConfig.tool
+      });
+
       return res.status(200).json({
         success: true,
         text: result.text,
-        tool: body.tool || null,
+        tool: body.tool || body.taskType || null,
         provider: result.provider,
-        model: result.model
+        model: result.model,
+        usage: result.usage
       });
     }
 
-    console.error("[AI Router] Fallback:", {
-      failedProvider: provider.name,
+    console.error("[AI Router] Moving to next provider:", {
+      failedProvider: provider,
       reason: result.reason,
       status: result.status
     });
@@ -238,6 +480,6 @@ export default async function handler(req, res) {
 
   return res.status(503).json({
     success: false,
-    error: "AI services are temporarily unavailable. Please retry."
+    error: "All AI providers are temporarily unavailable. Please try again."
   });
 }
